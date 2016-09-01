@@ -1,0 +1,64 @@
+#!/bin/bash -e
+# Requires root.  You will almost certainly need to modify this script.
+# For more information on guestinfo queries see the documentation.
+
+service consul stop
+echo "Taking down eth0"
+ip link set dev eth0 down
+echo "About to quiesce"
+
+vmware-rpctool "vmfork-begin -1 -1" > /dev/null
+
+if [ $? -eq 0 ]; then
+  # We're in the child now. Let's Perform basic customization.
+  vmware-rpctool "log End of fork; begin customization"
+
+  echo "Updating Hardware Clock on the system ..."
+  hwclock --hctosys
+
+  echo "Updating MAC Address ..."
+  ifconfig eth0 hw ether $(vmware-rpctool "info-get guestinfo.fork.ethernet0.address")
+
+  echo "Bringing up eth0"
+  ip link set dev eth0 up
+
+  echo "Getting new DHCP lease"
+  dhclient -r -v eth0
+  rm -f /var/lib/dhclient/*
+  dhclient -v eth0
+
+  service network restart
+
+
+  # retrieve networking info passed from script
+  DESIRED_HOSTNAME=$(vmware-rpctool "info-get guestinfo.fork.hostname")
+  SUV_NUMBER=$(echo $DESIRED_HOSTNAME | grep -Eo "([0-9]+)")
+
+  echo "Updating Hostname ..."
+  sed -i.bak "s/HOSTNAME=.*/HOSTNAME=$DESIRED_HOSTNAME\.smn\.dev\.pdx\.wd/" /etc/sysconfig/network
+  sed -i.bak "s/\(127\.0\.0\.1\s*\).*\(\.smn\.dev\.pdx\.wd\s*\).*/\1$DESIRED_HOSTNAME\2$DESIRED_HOSTNAME/g" /etc/hosts
+  sed -i.bak "s/vmfork-suv/$DESIRED_HOSTNAME/g" /etc/hosts
+  hostname ${DESIRED_HOSTNAME}.smn.dev.pdx.wd
+
+  sleep 10
+  until [[ $(ifconfig eth0) ]]; do
+    echo "Waiting for eth0 to come up"
+    sleep 5
+  done
+
+  echo "Updating consul config"
+  sed -i.bak "s/\(\"node_name\":\"\)[^\"]*\"/\1$DESIRED_HOSTNAME\"/g" /etc/consul/config.json
+  service consul start
+
+  echo "End of post ..."
+
+  IP_ADDRESS=$(hostname -I)
+  curl -X "PATCH" "https://[url]/suvs/$SUV_NUMBER" \
+    -H "Authorization: Basic [PW]" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    --data "{\"ip_address\": \"$IP_ADDRESS\", \"status\": \"running\" }"
+fi # vmfork-begin
+
+exit 0
+
